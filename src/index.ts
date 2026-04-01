@@ -1,11 +1,10 @@
 import { JSDOM } from 'jsdom';
 
+// Mock the browser environment
 const dom = new JSDOM('', { url: "http://localhost" });
 const { window } = dom;
-
-// Safely polyfill only what's missing or needs overriding
 const globals = {
-  window: window,
+  window,
   document: window.document,
   Node: window.Node,
   HTMLCanvasElement: window.HTMLCanvasElement,
@@ -19,10 +18,7 @@ Object.entries(globals).forEach(([key, value]) => {
   }
 });
 
-// Specifically for MediaPipe's WASM loader which checks for 'self'
-if (!('self' in global)) {
-  (global as any).self = global;
-}
+if (!('self' in global)) { (global as any).self = global; }
 
 import fs from 'fs';
 import path from 'path';
@@ -36,47 +32,76 @@ const OUTPUT_DIR = './output';
 const MODEL_PATH = './models/face_landmarker.task';
 
 async function setupDetector() {
-  const vision = await FilesetResolver.forVisionTasks(
-    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm"
-  );
-  return await FaceLandmarker.createFromOptions(vision, {
-    baseOptions: { modelAssetPath: MODEL_PATH, delegate: "CPU" },
-    runningMode: "IMAGE",
-    numFaces: 1
-  });
+  console.log("--- Initializing MediaPipe ---");
+  try {
+    // Use a local absolute path to avoid fetch/network hangs
+    const wasmPath = path.resolve("./node_modules/@mediapipe/tasks-vision/wasm");
+    
+    const vision = await FilesetResolver.forVisionTasks(wasmPath);
+    
+    console.log("--- WASM Loaded. Loading Model ---");
+    
+    const landmarker = await FaceLandmarker.createFromOptions(vision, {
+      baseOptions: { 
+        modelAssetPath: path.resolve(MODEL_PATH),
+        delegate: "CPU" 
+      },
+      runningMode: "IMAGE",
+      numFaces: 1
+    });
+    console.log("--- Detector Ready ---");
+    return landmarker;
+  } catch (err) {
+    console.error("Failed to initialize MediaPipe:", err);
+    throw err;
+  }
 }
 
 async function processImages() {
+  const absoluteInputPath = path.resolve(INPUT_DIR);
+  console.log(`Checking for images in: ${absoluteInputPath}`);
+
+  // Ensure output directory exists
+  if (!fs.existsSync(OUTPUT_DIR)) {
+    fs.mkdirSync(OUTPUT_DIR);
+  }
+
   const detector = await setupDetector();
   const files = fs.readdirSync(INPUT_DIR).filter(f => /\.(jpe?g|png)$/i.test(f));
 
-  console.log(`Found ${files.length} images. Starting extraction...`);
+  console.log(`--- Scan Complete: Found ${files.length} images in ${INPUT_DIR} ---`);
 
   for (const file of files) {
     const fileNameNoExt = path.parse(file).name;
-    const outputFileName = `${fileNameNoExt}.png`;
-    const outputPath = path.join(OUTPUT_DIR, outputFileName);
+    const outputPath = path.join(OUTPUT_DIR, `${fileNameNoExt}.png`);
 
-    // Skip if already processed
-    if (fs.existsSync(outputPath)) continue;
+    if (fs.existsSync(outputPath)) {
+      console.log(`[Skip] ${file} already exists in output.`);
+      continue;
+    }
+
+    console.log(`[Processing] ${file}...`);
 
     try {
       const inputPath = path.join(INPUT_DIR, file);
       const image = await loadImage(inputPath);
+      console.log(`  -> Image loaded: ${image.width}x${image.height}`);
       
-      // MediaPipe in Node needs a canvas-like source
       const canvas = createCanvas(image.width, image.height);
       const ctx = canvas.getContext('2d');
       ctx.drawImage(image, 0, 0);
 
+      // Perform detection
       const result = detector.detect(canvas as any);
 
       if (result.faceLandmarks && result.faceLandmarks.length > 0) {
-        // Take the first face (most confident)
+        console.log(`  -> Face detected! Finding mouth box...`);
         const landmarks = result.faceLandmarks[0];
         const box = landmarks ? getMouthBox(landmarks, image.width, image.height) : null;
 
         if (box) {
+          console.log(`  -> Mouth Box: x:${box.left}, y:${box.top}, size:${box.size}`);
+          
           await sharp(inputPath)
             .extract({ 
                 left: box.left, 
@@ -88,16 +113,20 @@ async function processImages() {
             .png()
             .toFile(outputPath);
           
-          console.log(`✔ Processed: ${file}`);
+          console.log(`  -> SUCCESS: Saved to ${outputPath}`);
+        } else {
+          console.warn(`  -> [Fail] Landmarks found but box calculation failed.`);
         }
       } else {
-        console.warn(`✘ No face detected: ${file}`);
+        console.warn(`  -> [Fail] No face detected by MediaPipe.`);
       }
     } catch (err) {
-      console.error(`Error processing ${file}:`, err);
+      console.error(`  -> [Error] Failed to process ${file}:`, err);
     }
   }
-  console.log('Done!');
+  console.log("--- All Done ---");
 }
 
-processImages();
+processImages().then(() => {
+  console.log("--- Process Execution Finished ---");
+}).catch(err => console.error("Critical Error:", err));
